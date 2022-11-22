@@ -1,0 +1,237 @@
+############################################
+AWSTemplateFormatVersion: 2010-09-09
+
+############################################# 
+
+############### Parameters ################
+Parameters:
+  UniqueIdentifier:
+    Type: String
+  
+  RepoName:
+    Description: Name of the Repo for Pipeline
+    Type: String
+  BranchName:
+    Description:  Name of the Branch in the repo for Pipeline
+    Type: String
+  MailFetchCount:
+   Type: Number
+  SecretNames:
+   Type: CommaDelimitedList
+  Rate:
+   Description:  Number of times at which EmailFeatch event should be triggered 
+   Type: Number
+  Schedule:
+   Description:  Unit of time in Minutes,Hours or Days. If Rate is 1, then Schedule should only be a singular unit. Example 1 minute or 1 hour.
+   Type: String
+   AllowedValues:
+    - minute
+    - minutes
+    - hour
+    - hours
+    - day
+    - days
+
+
+   
+######################################## Mappings for Build ComputeType  ###############
+
+
+###################################################################################
+Resources:
+
+#########################   IAM Role for CodePipeline & CodeBuild ###################  
+  CodePipeLineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - codepipeline.amazonaws.com
+                - lambda.amazonaws.com
+                - events.amazonaws.com
+                - codebuild.amazonaws.com
+            Action: 
+            - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+     
+     
+
+#############   S3 Bucket for Artifacts ################
+  ArtifactS3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+        BucketName: !Sub artifactbucket-${UniqueIdentifier}
+  ArtifactS3BucketPolicy:        
+    Type: 'AWS::S3::BucketPolicy'
+    Properties: 
+        Bucket: !Ref ArtifactS3Bucket
+        PolicyDocument: 
+          Version: 2012-10-17
+          Statement:
+            - Action:
+                - 's3:*'
+              Effect: Allow
+              Resource:
+                - !Sub arn:aws:s3:::${ArtifactS3Bucket}
+                - !Sub arn:aws:s3:::${ArtifactS3Bucket}/*
+              Principal: 
+                AWS: '*'
+#############   Lambda to delete Artifacts in S3 Bucket ################ 
+  EmptyS3BucketLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      #FunctionName: !Sub '${AWS::StackName}-EmptyS3BucketLambdaFunction'
+      Handler: index.lambda_handler
+      Code: 
+         ZipFile: |
+          from __future__ import print_function
+          import json, boto3, logging
+          import urllib3
+          import json
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+          
+          def lambda_handler(event, context):
+            logger.info("event: {}".format(event))
+            try:
+                bucket = event['ResourceProperties']['BucketName']
+                logger.info("bucket: {}, event['RequestType']: {}".format(bucket,event['RequestType']))
+                if event['RequestType'] == 'Delete':
+                    s3 = boto3.resource('s3')
+                    bucket = s3.Bucket(bucket)
+                    for obj in bucket.objects.filter():
+                        logger.info("delete obj: {}".format(obj))
+                        s3.Object(bucket.name, obj.key).delete()
+                        bucket.object_versions.filter(Prefix=obj.key).delete()
+                        logger.info("Permanently deleted all versions of object %s.", obj.key)  
+                    bucket.object_versions.all().delete()
+                sendResponseCfn(event, context, SUCCESS)
+            except Exception as e:
+                logger.info("Exception: {}".format(e))
+                logger.exception("Couldn't delete all versions found Exception")
+                sendResponseCfn(event, context, FAILED)
+          
+          def sendResponseCfn(event, context, responseStatus):
+            responseData = {}
+            responseData['Data'] = {}
+            send(event, context, responseStatus, responseData, "CustomResourcePhysicalID")
+          http = urllib3.PoolManager()
+          def send(event, context, responseStatus, responseData, physicalResourceId=None, noEcho=False, reason=None):
+              responseUrl = event['ResponseURL']
+              print(responseUrl)
+              responseBody = {
+                  'Status' : responseStatus,
+                  'Reason' : reason or "See the details in CloudWatch Log Stream: {}".format(context.log_stream_name),
+                  'PhysicalResourceId' : physicalResourceId or context.log_stream_name,
+                  'StackId' : event['StackId'],
+                  'RequestId' : event['RequestId'],
+                  'LogicalResourceId' : event['LogicalResourceId'],
+                  'NoEcho' : noEcho,
+                  'Data' : responseData
+              }
+              json_responseBody = json.dumps(responseBody)
+              print("Response body:")
+              print(json_responseBody)
+              headers = {
+                  'content-type' : '',
+                  'content-length' : str(len(json_responseBody))
+              }
+              try:
+                  response = http.request('PUT', responseUrl, headers=headers, body=json_responseBody)
+                  print("Status code:", response.status)
+              except Exception as e: 
+                  print("send(..) failed executing http.request(..):", e)
+      Role: !GetAtt CodePipeLineRole.Arn
+      Runtime: python3.7
+      Timeout: 900
+      TracingConfig:
+        Mode: Active 
+
+  cleanupArtifactBucket:
+    Type: Custom::ArtifactBucket
+    Properties:
+      ServiceToken: !GetAtt EmptyS3BucketLambdaFunction.Arn
+      BucketName: !Ref ArtifactS3Bucket
+
+###################   CodePipeline ###########
+  CodePipelineSam:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${AWS::StackName}
+      RoleArn: !GetAtt CodePipeLineRole.Arn
+      ArtifactStore: 
+        Type: S3
+        Location: !Ref ArtifactS3Bucket
+      Stages: 
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: 
+                Category: Source
+                Owner: AWS
+                Version: '1'
+                Provider: CodeCommit
+              Configuration:
+                RepositoryName: !Ref RepoName
+                BranchName: !Ref BranchName
+              OutputArtifacts:
+                - Name: !Sub 'SourceSamOutputArtifacts-${BranchName}-${AWS::AccountId}'
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: '1'
+                Provider: CodeBuild
+              Configuration: 
+                ProjectName: !Ref CodeBuildSam
+              InputArtifacts:
+                - Name: !Sub 'SourceSamOutputArtifacts-${BranchName}-${AWS::AccountId}'
+              OutputArtifacts:
+                - Name: !Sub 'BuildSamOutputArtifacts-${BranchName}-${AWS::AccountId}'
+              RunOrder: 1       
+
+##############   CodeBuild ###################  
+  CodeBuildSam:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}
+      Description: Backend Build for SAM Deployment
+      ServiceRole: !GetAtt CodePipeLineRole.Arn
+      Source: 
+        BuildSpec: buildspec.yml
+        Type: CODEPIPELINE
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:5.0
+        EnvironmentVariables:
+          - Name: UniqueIdentifier
+            Value: !Ref UniqueIdentifier
+          - Name: samstack
+            Value: !Sub '${AWS::StackName}-samresources'
+          - Name: ArtifactS3Bucket
+            Value: !Ref ArtifactS3Bucket
+          - Name: MailFetchCount
+            Value: !Ref MailFetchCount
+          - Name: SecretNames
+            Value: !Join ["_",!Ref SecretNames]
+          - Name: ScheduledRate
+            Value: !Sub "${Rate}-${Schedule}"
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+  
+
+  

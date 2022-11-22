@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+
+
+###################  Parameters for SAM Template  ###############
+###### ############  Values to the below Paramters are passed from buildspec.yml file in create SAM resources command ############# 
+Parameters:
+  
+  UniqueIdentifier:
+   Type: String
+  SecretNames:
+   Type: String
+  ScheduledRate:
+   Type: String  
+  MailFetchCount:
+   Type: Number   
+     
+
+Resources:
+
+################################ IAM Roles  #################################
+
+  ExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      Description: 'Execution role for lambdas'
+      RoleName: !Sub '${AWS::StackName}-Role'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: 
+              AWS: '*'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+
+  
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Code: 
+         ZipFile: |
+           def handler(event, context):
+           print("Your Code Goes @here")
+      Role: !GetAtt ExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 900
+      TracingConfig:
+        Mode: Active
+
+  
+
+####################################  Lambda Function to Create EventBridges   ######################################
+
+  
+  EventBridgeCreation:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Code: 
+         ZipFile: |
+            from __future__ import print_function
+            import urllib3
+            import json
+            import boto3, logging
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+            
+            SUCCESS = "SUCCESS"
+            FAILED = "FAILED"
+            
+            def lambda_handler(event, context):
+              logger.info("event: {}".format(event))
+              try:
+                  Secret_Names = event['ResourceProperties']['Secret_Names']
+                  logger.info("EvntRule: {}, event['RequestType']: {}".format(Secret_Names,event['RequestType']))
+                  jsonform=''
+                  Functionarn = event['ResourceProperties']['Functionarn']
+                  tmpvariable = event['ResourceProperties']['UniqueIdentifier']
+                  UniqueIdentifier =  tmpvariable + "-"
+                  eventclient = boto3.client('events')
+                  rate="rate("+event['ResourceProperties']['rate']+")"
+                  if event['RequestType'] == 'Delete':
+                    print("Deleting the Rules")
+                    for i in Secret_Names: 
+                        rule_targets = eventclient.list_targets_by_rule(
+                              Rule = UniqueIdentifier+i
+                          )['Targets']
+                        target_ids = [target['Id'] for target in rule_targets]
+                        logger.info("target_ids: {}".format(target_ids))
+                        response = eventclient.remove_targets(
+                            Rule= UniqueIdentifier+i,
+                            Ids= target_ids
+                        )
+                        print(response)
+                        delete_rules = eventclient.delete_rule(
+                            Name = UniqueIdentifier+i
+                        )
+                        logger.info("delete_rules: {}".format(delete_rules))
+                  elif event['RequestType'] == 'Create' or 'Update':
+                    print("Creating the Rules")
+                    for rules in Secret_Names:
+                        logger.info("Rules: {}".format(rules))
+                        jsonform=json.dumps({'secret_name':rules})
+                        response = eventclient.put_rule(
+                            Name=UniqueIdentifier+rules,
+                            ScheduleExpression=rate,
+                            State='ENABLED'
+                          )
+                        response= eventclient.put_targets(
+                            Rule=UniqueIdentifier+rules,
+                            Targets=[
+                                {
+                                    'Id': '001',
+                                    'Arn': Functionarn ,
+                                    'Input': jsonform
+                                }
+                                ]
+                          )
+                  sendResponseCfn(event, context, SUCCESS)
+              except Exception as e:
+                  logger.info("Exception: {}".format(e))
+                  logger.exception("Couldn't Create Functiom")
+                  sendResponseCfn(event, context, FAILED)
+            def sendResponseCfn(event, context, responseStatus):
+              responseData = {}
+              responseData['Data'] = {}
+              send(event, context, responseStatus, responseData, "CustomResourcePhysicalID")
+            
+            
+            http = urllib3.PoolManager()
+            
+            
+            def send(event, context, responseStatus, responseData, physicalResourceId=None, noEcho=False, reason=None):
+                responseUrl = event['ResponseURL']
+            
+                print(responseUrl)
+            
+                responseBody = {
+                    'Status' : responseStatus,
+                    'Reason' : reason or "See the details in CloudWatch Log Stream: {}".format(context.log_stream_name),
+                    'PhysicalResourceId' : physicalResourceId or context.log_stream_name,
+                    'StackId' : event['StackId'],
+                    'RequestId' : event['RequestId'],
+                    'LogicalResourceId' : event['LogicalResourceId'],
+                    'NoEcho' : noEcho,
+                    'Data' : responseData
+                }
+            
+                json_responseBody = json.dumps(responseBody)
+            
+                print("Response body:")
+                print(json_responseBody)
+            
+                headers = {
+                    'content-type' : '',
+                    'content-length' : str(len(json_responseBody))
+                }
+            
+                try:
+                    response = http.request('PUT', responseUrl, headers=headers, body=json_responseBody)
+                    print("Status code:", response.status)
+            
+            
+                except Exception as e:
+            
+                    print("send(..) failed executing http.request(..):", e)
+      Role: !GetAtt ExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 900
+      TracingConfig:
+        Mode: Active
+            
+  CustomEventBridgeCreation:
+    Type: Custom::EventBridgeCreation
+    Properties:
+      ServiceToken: !GetAtt EventBridgeCreation.Arn
+      Secret_Names: !Split ["_", !Ref SecretNames]
+      Functionarn: !GetAtt LambdaFunction.Arn
+      UniqueIdentifier: !Ref UniqueIdentifier
+      rate: !Join [" ",!Split ["-",!Ref ScheduledRate]]
+    DependsOn:
+     - LambdaFunction
+
+  EmailFetchInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${UniqueIdentifier}*'
+
